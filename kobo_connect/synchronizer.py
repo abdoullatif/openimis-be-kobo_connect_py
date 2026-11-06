@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from django.apps import apps
 from django.core.exceptions import ValidationError
-from django.db import transaction, models as djm
+from django.db import IntegrityError, transaction, models as djm
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
@@ -280,6 +280,40 @@ def _maybe_set_resolved(ticket) -> bool:
 # Recherche / Mapping / Upsert
 # ---------------------------------------------------------------------------
 
+def _resolve_active_history_entity(obj: Any) -> Any:
+    """Suit ReplacementUUID jusqu'à la version active (évite save sur entité remplacée)."""
+    if obj is None:
+        return None
+    seen = set()
+    current = obj
+    while current is not None:
+        replacement = getattr(current, "replacement_uuid", None)
+        if not replacement:
+            return current
+        pk = getattr(current, "pk", None) or getattr(current, "id", None)
+        if pk in seen:
+            logger.warning("[Kobo Sync] Boucle ReplacementUUID détectée sur %s", pk)
+            return current
+        seen.add(pk)
+        nxt = current.__class__.objects.filter(pk=replacement).first()
+        if nxt is None:
+            return current
+        current = nxt
+    return obj
+
+
+def _ticket_by_code(ref_value: Any) -> Optional[Any]:
+    """Préfère le ticket actif ; sinon n'importe quel match (évite duplicate key)."""
+    qs = Ticket.objects.filter(code=ref_value)
+    active = qs.filter(date_valid_to__isnull=True, is_deleted=False).first()
+    if active:
+        return active
+    alive = qs.filter(is_deleted=False).first()
+    if alive:
+        return alive
+    return qs.first()
+
+
 def _find_existing_ticket(row: Dict[str, Any], direct_map: Dict[str, str]) -> Optional[Any]:
     """Tente de retrouver un Ticket existant par 'code', puis métadonnées Kobo."""
     ref_value = None
@@ -289,9 +323,9 @@ def _find_existing_ticket(row: Dict[str, Any], direct_map: Dict[str, str]) -> Op
             break
     if ref_value:
         try:
-            obj = Ticket.objects.filter(code=ref_value).first()
+            obj = _ticket_by_code(ref_value)
             if obj:
-                return obj
+                return _resolve_active_history_entity(obj)
         except Exception:
             pass
 
@@ -305,7 +339,7 @@ def _find_existing_ticket(row: Dict[str, Any], direct_map: Dict[str, str]) -> Op
         try:
             obj = Ticket.objects.filter(**{field: value}).first()
             if obj:
-                return obj
+                return _resolve_active_history_entity(obj)
         except Exception:
             continue
     return None
@@ -330,7 +364,6 @@ def _apply_mapping(
         val = row[kobo_key]
         if resolve_label is not None:
             val = resolve_label(kobo_key, val)
-            print('*****val', val)
 
         # Parsing dates
         if model_field.endswith(("_at", "_date", "submitted_at")):
@@ -353,6 +386,21 @@ def _apply_mapping(
 
         if isinstance(val, str):
             val = val.strip()
+
+        # Labels Kobo (ex. sub_category) peuvent dépasser max_length CharField.
+        if (
+            isinstance(val, str)
+            and isinstance(field_obj, djm.CharField)
+            and field_obj.max_length
+            and len(val) > field_obj.max_length
+        ):
+            logger.warning(
+                "[Kobo Sync] Troncature %s: %s -> %s caractères",
+                model_field,
+                len(val),
+                field_obj.max_length,
+            )
+            val = val[: field_obj.max_length]
 
         changed |= _assign_if_changed(ticket, model_field, val)
 
@@ -395,7 +443,6 @@ def _apply_mapping_other(
         val = row[kobo_key]
         if resolve_label is not None:
             val = resolve_label(kobo_key, val)
-            print('*****val', val)
 
         # Parsing dates
         if model_field.endswith(("_at", "_date", "submitted_at")):
@@ -418,6 +465,20 @@ def _apply_mapping_other(
 
         if isinstance(val, str):
             val = val.strip()
+
+        if (
+            isinstance(val, str)
+            and isinstance(field_obj, djm.CharField)
+            and field_obj.max_length
+            and len(val) > field_obj.max_length
+        ):
+            logger.warning(
+                "[Kobo Sync] Troncature %s: %s -> %s caractères",
+                model_field,
+                len(val),
+                field_obj.max_length,
+            )
+            val = val[: field_obj.max_length]
 
         changed |= _assign_if_changed(submission, model_field, val)
 
@@ -487,64 +548,99 @@ def start_sync(kobo_form: KoboForm, user=None, since: Optional[timezone.datetime
                     max_submission_ts = sub_ts
 
                 try:
-                    with transaction.atomic():
-                        ticket = _find_existing_ticket(row, direct_map) or Ticket()
-                        # (Optionnel) Liaison d'une Location si le modèle possède un champ 'location'
-                        loc = _resolve_location_from_row(row)
-                        if loc is not None and hasattr(ticket, "location"):
-                            _assign_if_changed(ticket, "location", loc)
+                    try:
+                        with transaction.atomic():
+                            ticket = _find_existing_ticket(row, direct_map) or Ticket()
+                            # (Optionnel) Liaison d'une Location si le modèle possède un champ 'location'
+                            loc = _resolve_location_from_row(row)
+                            if loc is not None and hasattr(ticket, "location"):
+                                _assign_if_changed(ticket, "location", loc)
 
-                        json_ext, changed = _apply_mapping(row, direct_map, extras_map, ticket, resolve_label=resolve_label)
+                            json_ext, changed = _apply_mapping(
+                                row, direct_map, extras_map, ticket, resolve_label=resolve_label,
+                            )
 
-                        # Règles métier: priority / status / date_of_incident
-                        try:
-                            prio = _infer_priority(row, getattr(ticket, "category", None))
-                            if prio:
-                                changed |= _assign_if_changed(ticket, "priority", prio)
-                        except Exception:
-                            pass
+                            # Règles métier: priority / status / date_of_incident
+                            try:
+                                prio = _infer_priority(row, getattr(ticket, "category", None))
+                                if prio:
+                                    changed |= _assign_if_changed(ticket, "priority", prio)
+                            except Exception:
+                                pass
 
-                        try:
-                            changed |= _maybe_set_resolved(ticket)
-                        except Exception:
-                            pass
+                            try:
+                                changed |= _maybe_set_resolved(ticket)
+                            except Exception:
+                                pass
 
-                        try:
-                            incident_date = _infer_incident_date(row, sub_ts)
-                            if incident_date is not None:
-                                changed |= _assign_if_changed(ticket, "date_of_incident", incident_date)
-                        except Exception:
-                            pass
+                            try:
+                                incident_date = _infer_incident_date(row, sub_ts)
+                                if incident_date is not None:
+                                    changed |= _assign_if_changed(ticket, "date_of_incident", incident_date)
+                            except Exception:
+                                pass
 
-                        # Champs génériques facultatifs
-                        if hasattr(ticket, "json_ext"):
-                            if (getattr(ticket, "json_ext", {}) or {}) != json_ext:
-                                ticket.json_ext = json_ext
-                                changed = True
-                        if hasattr(ticket, "submitted_at") and sub_ts:
-                            changed |= _assign_if_changed(ticket, "submitted_at", sub_ts)
-                        if hasattr(ticket, "source") and not getattr(ticket, "source", None):
-                            changed |= _assign_if_changed(ticket, "source", "KOBO")
+                            # Champs génériques facultatifs
+                            if hasattr(ticket, "json_ext"):
+                                if (getattr(ticket, "json_ext", {}) or {}) != json_ext:
+                                    ticket.json_ext = json_ext
+                                    changed = True
+                            if hasattr(ticket, "submitted_at") and sub_ts:
+                                changed |= _assign_if_changed(ticket, "submitted_at", sub_ts)
+                            if hasattr(ticket, "source") and not getattr(ticket, "source", None):
+                                changed |= _assign_if_changed(ticket, "source", "KOBO")
 
-                        if dry_run:
-                            logger.info("[Dry-Run] Ticket simulé (create/update): %s", getattr(ticket, "code", None))
-                        else:
-                            is_create = ticket.pk is None
-                            if is_create or changed:
-                                try:
-                                    # Fixer max_escalation_level selon la catégorie
-                                    # sensible peut monter jusqu’au national
-                                    # ticket.max_escalation_level = 4 if ticket.priority == "Critical" else 3
-                                    ticket.save(user=user)
-                                    bootstrap_escalation_fields(ticket)
-                                except TypeError:
-                                    ticket.save()
-                                if is_create:
-                                    created += 1
-                                else:
-                                    updated += 1
+                            if dry_run:
+                                logger.info(
+                                    "[Dry-Run] Ticket simulé (create/update): %s",
+                                    getattr(ticket, "code", None),
+                                )
                             else:
-                                skipped += 1  # aucun changement → ne pas sauver pour éviter ValidationError
+                                is_create = ticket.pk is None
+                                if is_create or changed:
+                                    try:
+                                        ticket.save(user=user)
+                                        bootstrap_escalation_fields(ticket)
+                                    except TypeError:
+                                        ticket.save()
+                                    if is_create:
+                                        created += 1
+                                    else:
+                                        updated += 1
+                                else:
+                                    skipped += 1
+                    except IntegrityError:
+                        # Transaction abortée : retenter en update hors du bloc précédent
+                        code_val = None
+                        for kobo_key, target in direct_map.items():
+                            if target == "code" and kobo_key in row:
+                                code_val = row[kobo_key]
+                                break
+                        existing = _resolve_active_history_entity(
+                            _ticket_by_code(code_val),
+                        ) if code_val else None
+                        if existing is None:
+                            raise
+                        with transaction.atomic():
+                            ticket = existing
+                            loc = _resolve_location_from_row(row)
+                            if loc is not None and hasattr(ticket, "location"):
+                                _assign_if_changed(ticket, "location", loc)
+                            json_ext, changed = _apply_mapping(
+                                row, direct_map, extras_map, ticket, resolve_label=resolve_label,
+                            )
+                            if hasattr(ticket, "json_ext"):
+                                ticket.json_ext = json_ext
+                            if hasattr(ticket, "submitted_at") and sub_ts:
+                                _assign_if_changed(ticket, "submitted_at", sub_ts)
+                            if hasattr(ticket, "source") and not getattr(ticket, "source", None):
+                                _assign_if_changed(ticket, "source", "KOBO")
+                            try:
+                                ticket.save(user=user)
+                                bootstrap_escalation_fields(ticket)
+                            except TypeError:
+                                ticket.save()
+                            updated += 1
 
                 except ValidationError as ve:
                     # HistoryBusinessModel peut lever si aucun changement; on le compte en 'skipped'
@@ -659,12 +755,23 @@ def start_sync(kobo_form: KoboForm, user=None, since: Optional[timezone.datetime
         logger.exception("[Kobo Sync] Erreur pendant la collecte des soumissions")
         return
 
-    # Mise à jour du pointeur temporel
-    setattr(kobo_form, "last_sync_date", max_submission_ts or timezone.now())
+    # Mise à jour du pointeur temporel (sur la version active si form remplacé)
+    sync_pointer = max_submission_ts or timezone.now()
+    form_to_update = _resolve_active_history_entity(kobo_form) or kobo_form
+    setattr(form_to_update, "last_sync_date", sync_pointer)
+    # Garder aussi le form passé à start_sync à jour en mémoire
+    setattr(kobo_form, "last_sync_date", sync_pointer)
     try:
-        kobo_form.save(user=user)
+        form_to_update.save(user=user)
     except TypeError:
-        kobo_form.save()
+        form_to_update.save()
+    except ValidationError as ve:
+        # Formulaire marqué remplacé / sans dirty fields : ne bloque pas le log end
+        logger.warning(
+            "[Kobo Sync] Impossible de sauver last_sync_date sur %s: %s",
+            getattr(form_to_update, "id", None),
+            ve,
+        )
 
     _save_log(
         kobo_form,
