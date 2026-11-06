@@ -43,15 +43,28 @@ except Exception:  # pragma: no cover
 # Utilitaires de dates / booléens / logs / mapping
 # ---------------------------------------------------------------------------
 
+def _ensure_aware(dt: Optional[timezone.datetime]) -> Optional[timezone.datetime]:
+    """Normalise naive/aware pour éviter TypeError à la comparaison."""
+    if dt is None:
+        return None
+    if timezone.is_aware(dt):
+        return dt
+    try:
+        return timezone.make_aware(dt)
+    except Exception:
+        # Fallback si already in a weird state / USE_TZ edge cases
+        return dt.replace(tzinfo=timezone.utc) if getattr(dt, "tzinfo", None) is None else dt
+
+
 def _parse_ts(value: Any) -> Optional[timezone.datetime]:
     if not value:
         return None
     if isinstance(value, timezone.datetime):
-        return value if timezone.is_aware(value) else timezone.make_aware(value)
+        return _ensure_aware(value)
     dt = parse_datetime(str(value))
     if dt is None:
         return None
-    return dt if timezone.is_aware(dt) else timezone.make_aware(dt)
+    return _ensure_aware(dt)
 
 
 def should_sync(form: KoboForm) -> bool:
@@ -64,6 +77,7 @@ def should_sync(form: KoboForm) -> bool:
         return True
     if not last:
         return True
+    last = _ensure_aware(last)
     return timezone.now() - last >= timedelta(minutes=interval)
 
 
@@ -525,15 +539,17 @@ def start_sync(kobo_form: KoboForm, user=None, since: Optional[timezone.datetime
 
     direct_map, extras_map = _build_mapping(kobo_form)
 
-    # borne temporelle (BACKOFF)
-    _since = since or getattr(kobo_form, "last_sync_date", None)
+    # borne temporelle (BACKOFF) — toujours aware pour comparer aux timestamps Kobo
+    _since = _ensure_aware(since or getattr(kobo_form, "last_sync_date", None))
     if _since:
         _since = _since - timedelta(minutes=BACKOFF_MINUTES)
 
     _save_log(kobo_form, user, status="success", action="start", message=f"Début sync UID={uid}")
 
     created = updated = skipped = failed = 0
-    max_submission_ts: Optional[timezone.datetime] = getattr(kobo_form, "last_sync_date", None)
+    max_submission_ts: Optional[timezone.datetime] = _ensure_aware(
+        getattr(kobo_form, "last_sync_date", None),
+    )
 
     try:
         if kobo_form.module == 'grievance_social_protection':
