@@ -802,8 +802,17 @@ def start_sync(kobo_form: KoboForm, user=None, since: Optional[timezone.datetime
         logger.exception("[Kobo Sync] Erreur pendant la collecte des soumissions")
         return
 
-    # Mise à jour du pointeur temporel (sur la version active si form remplacé)
-    sync_pointer = max_submission_ts or timezone.now()
+    # last_sync_date = horodatage de l'exécution (attendu dans l'admin / sync_interval).
+    # Le filtre incrémental utilise ce pointeur au prochain run ; on prend le max avec
+    # la plus récente soumission Kobo pour ne pas reculer le curseur.
+    now = timezone.now()
+    sync_pointer = max_submission_ts or now
+    try:
+        if _dt_diff(now, sync_pointer) > timedelta(0):
+            sync_pointer = now
+    except Exception:
+        sync_pointer = now
+
     form_to_update = _resolve_active_history_entity(kobo_form) or kobo_form
     setattr(form_to_update, "last_sync_date", sync_pointer)
     # Garder aussi le form passé à start_sync à jour en mémoire
@@ -813,12 +822,22 @@ def start_sync(kobo_form: KoboForm, user=None, since: Optional[timezone.datetime
     except TypeError:
         form_to_update.save()
     except ValidationError as ve:
-        # Formulaire marqué remplacé / sans dirty fields : ne bloque pas le log end
+        # Formulaire marqué remplacé / sans dirty fields : forcer via queryset
         logger.warning(
-            "[Kobo Sync] Impossible de sauver last_sync_date sur %s: %s",
+            "[Kobo Sync] save() last_sync_date refusé sur %s (%s) — fallback update()",
             getattr(form_to_update, "id", None),
             ve,
         )
+        try:
+            type(form_to_update).objects.filter(pk=form_to_update.pk).update(
+                last_sync_date=sync_pointer,
+            )
+        except Exception as upd_err:
+            logger.warning(
+                "[Kobo Sync] Impossible de sauver last_sync_date sur %s: %s",
+                getattr(form_to_update, "id", None),
+                upd_err,
+            )
 
     _save_log(
         kobo_form,
