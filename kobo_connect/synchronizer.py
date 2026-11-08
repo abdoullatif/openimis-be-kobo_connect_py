@@ -47,13 +47,45 @@ def _ensure_aware(dt: Optional[timezone.datetime]) -> Optional[timezone.datetime
     """Normalise naive/aware pour éviter TypeError à la comparaison."""
     if dt is None:
         return None
-    if timezone.is_aware(dt):
-        return dt
+    try:
+        if timezone.is_aware(dt):
+            return dt
+    except Exception:
+        pass
     try:
         return timezone.make_aware(dt)
     except Exception:
-        # Fallback si already in a weird state / USE_TZ edge cases
-        return dt.replace(tzinfo=timezone.utc) if getattr(dt, "tzinfo", None) is None else dt
+        pass
+    try:
+        from datetime import timezone as dt_timezone
+        if getattr(dt, "tzinfo", None) is None:
+            return dt.replace(tzinfo=dt_timezone.utc)
+    except Exception:
+        pass
+    return dt
+
+
+def _to_naive_utc(dt: timezone.datetime) -> timezone.datetime:
+    """Force un datetime naïf comparable (UTC si aware)."""
+    try:
+        if timezone.is_aware(dt):
+            return timezone.make_naive(dt, timezone.utc)
+    except Exception:
+        pass
+    try:
+        if getattr(dt, "tzinfo", None) is not None:
+            return dt.replace(tzinfo=None)
+    except Exception:
+        pass
+    return dt
+
+
+def _dt_diff(a: timezone.datetime, b: timezone.datetime) -> timedelta:
+    """Soustraction robuste naive/aware (openIMIS DateTimeField souvent naïf)."""
+    try:
+        return a - b
+    except TypeError:
+        return _to_naive_utc(a) - _to_naive_utc(b)
 
 
 def _parse_ts(value: Any) -> Optional[timezone.datetime]:
@@ -77,8 +109,7 @@ def should_sync(form: KoboForm) -> bool:
         return True
     if not last:
         return True
-    last = _ensure_aware(last)
-    return timezone.now() - last >= timedelta(minutes=interval)
+    return _dt_diff(timezone.now(), last) >= timedelta(minutes=interval)
 
 
 def _get_token(form: KoboForm) -> KoboToken:
@@ -801,14 +832,27 @@ def start_sync(kobo_form: KoboForm, user=None, since: Optional[timezone.datetime
 
 def sync_all_kobo_forms() -> None:
     """Appelée par un scheduler : exécute start_sync() pour les formulaires éligibles."""
-    for form in KoboForm.objects.all().iterator():
+    qs = KoboForm.objects.filter(auto_sync=True)
+    # Ignorer versions remplacées / inactives si les champs existent
+    if hasattr(KoboForm, "date_valid_to"):
+        qs = qs.filter(date_valid_to__isnull=True)
+    if hasattr(KoboForm, "is_deleted"):
+        qs = qs.filter(is_deleted=False)
+    if hasattr(KoboForm, "is_active"):
+        qs = qs.filter(is_active=True)
+
+    for form in qs.iterator():
         try:
-            if not getattr(form, "auto_sync", False):
-                continue
             if not should_sync(form):
+                logger.debug(
+                    "[Scheduler] Skip %s (interval=%s, last=%s)",
+                    getattr(form, "kobo_uid", form.pk),
+                    getattr(form, "sync_interval", None),
+                    getattr(form, "last_sync_date", None),
+                )
                 continue
             user = getattr(form, "user", None)
-            logger.info(f"[Scheduler] Sync {form} (UID={getattr(form, 'kobo_uid', '?')})")
+            logger.info("[Scheduler] Sync %s (UID=%s)", form, getattr(form, "kobo_uid", "?"))
             start_sync(form, user=user)
         except Exception as e:
-            logger.error(f"[Scheduler] Erreur de sync pour {form}: {e}")
+            logger.exception("[Scheduler] Erreur de sync pour %s: %s", form, e)
